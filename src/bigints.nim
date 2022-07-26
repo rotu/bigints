@@ -3,21 +3,40 @@
 import std/[algorithm, bitops, math, options]
 
 type
+  Sgn* {.pure.} = enum
+    negative = -1
+    zero = 0
+    positive = +1
   BigInt* = object
     ## An arbitrary precision integer.
     # Invariants for `a: BigInt`:
     # * if `a` is non-zero: `a.limbs[a.limbs.high] != 0`
     # * if `a` is zero: `a.limbs.len <= 1`
     limbs: seq[uint32]
-    isNegative: bool
+    sgn: Sgn
 
+converter toIntegral(s:Sgn):int = int(s)
+proc `*`(s1:Sgn, s2:Sgn):Sgn =
+  Sgn(int(s1)*int(s2))
+proc `*`(s:Sgn, r:SomeInteger):SomeInteger =
+  case s:
+    of Sgn.negative:      result = -r
+    of Sgn.positive:      result = +r
+    of Sgn.zero:      result = 0
+
+proc abs(s:Sgn):Sgn =
+  case s:
+    of Sgn.negative, Sgn.positive: Sgn.positive
+    of Sgn.zero: Sgn.zero
 
 func normalize(a: var BigInt) =
-  for i in countdown(a.limbs.high, 0):
-    if a.limbs[i] > 0'u32:
-      a.limbs.setLen(i+1)
-      return
-  a.limbs.setLen(1)
+  if a.sgn != Sgn.zero:
+    for i in countdown(a.limbs.high, 0):
+      if a.limbs[i] > 0'u32:
+        a.limbs.setLen(i+1)
+        return
+  a.limbs.setLen(0)
+  a.sgn = Sgn.zero
 
 func initBigInt*(vals: sink seq[uint32], isNegative = false): BigInt =
   ## Initializes a `BigInt` from a sequence of `uint32` values.
@@ -26,35 +45,40 @@ func initBigInt*(vals: sink seq[uint32], isNegative = false): BigInt =
     let b = 10 + 2 shl 32
     assert $a == $b
   result.limbs = vals
-  result.isNegative = isNegative
+  result.sgn = if isNegative: negative else: positive
   normalize(result)
 
 converter initBigInt*[T: int8|int16|int32](val: T): BigInt =
-  if val < 0:
+  let s = Sgn(sgn(val))
+  case s:
+  of Sgn.zero:
+    result.limbs = @[]
+  of Sgn.negative:
     result.limbs = @[(not val).uint32 + 1] # manual 2's complement (to avoid overflow)
-    result.isNegative = true
-  else:
+  of Sgn.positive:
     result.limbs = @[val.uint32]
-    result.isNegative = false
+  result.sgn = s 
 
 func initBigInt*[T: uint8|uint16|uint32](val: T): BigInt =
-  result.limbs = @[val.uint32]
-
-converter initBigInt*(val: int64): BigInt =
-  var a = val.uint64
-  if val < 0:
-    a = not a + 1 # 2's complement
-    result.isNegative = true
-  if a > uint32.high:
-    result.limbs = @[(a and uint32.high).uint32, (a shr 32).uint32]
+  if (val != 0):
+    result.sgn = Sgn.positive
+    result.limbs = @[val.uint32]
   else:
-    result.limbs = @[a.uint32]
+    assert result.sgn == Sgn.zero
+    assert result.limbs == @[]
 
 func initBigInt*(val: uint64): BigInt =
   if val > uint32.high:
     result.limbs = @[(val and uint32.high).uint32, (val shr 32).uint32]
   else:
     result.limbs = @[val.uint32]
+
+converter initBigInt*(val: int64): BigInt =
+  var a = (if val<0:
+    not val + 1 # 2's complement
+    else: val)
+  result = initBigInt(a.uint64)
+  result.sgn = Sgn(sgn(val))
 
 when sizeof(int) == 4:
   converter initBigInt*(val: int): BigInt = initBigInt(val.int32)
@@ -71,7 +95,7 @@ const
   one = initBigInt(1)
 
 func isZero(a: BigInt): bool {.inline.} =
-  a.limbs.len == 0 or (a.limbs.len == 1 and a.limbs[0] == 0)
+  a.sgn == Sgn.zero
 
 func abs*(a: BigInt): BigInt =
   # Returns the absolute value of `a`.
@@ -79,7 +103,7 @@ func abs*(a: BigInt): BigInt =
     assert abs(42.initBigInt) == 42.initBigInt
     assert abs(-12.initBigInt) == 12.initBigInt
   result = a
-  result.isNegative = false
+  result.sgn = abs(result.sgn)
 
 func unsignedCmp(a: BigInt, b: uint32): int64 =
   # ignores the sign of `a`
@@ -105,43 +129,10 @@ func cmp(a, b: BigInt): int64 =
   ## * a value less than zero, if `a < b`
   ## * a value greater than zero, if `a > b`
   ## * zero, if `a == b`
-  if a.isZero:
-    if b.isZero:
-      return 0
-    elif b.isNegative:
-      return 1
-    else:
-      return -1
-  elif a.isNegative:
-    if b.isZero or not b.isNegative:
-      return -1
-    else:
-      return unsignedCmp(b, a)
-  else: # a > 0
-    if b.isZero or b.isNegative:
-      return 1
-    else:
-      return unsignedCmp(a, b)
+  if (a.sgn != b.sgn):
+    return cmp(a.sgn, b.sgn)
 
-func cmp(a: BigInt, b: int32): int64 =
-  ## Returns:
-  ## * a value less than zero, if `a < b`
-  ## * a value greater than zero, if `a > b`
-  ## * zero, if `a == b`
-  if a.isZero:
-    return -b.int64
-  elif a.isNegative:
-    if b < 0:
-      return unsignedCmp((not b).uint32 + 1, a)
-    else:
-      return -1
-  else: # a > 0
-    if b <= 0:
-      return 1
-    else:
-      return unsignedCmp(a, b.uint32)
-
-func cmp(a: int32, b: BigInt): int64 = -cmp(b, a)
+  a.sgn * unsignedCmp(a, b)
 
 func `==`*(a, b: BigInt): bool =
   ## Compares if two `BigInt` numbers are equal.
@@ -192,7 +183,7 @@ func unsignedAdditionInt(a: var BigInt, b: BigInt, c: uint32) =
     addParts(uint64(b.limbs[i]))
   if tmp > 0'u64:
     a.limbs.add(uint32(tmp))
-  a.isNegative = false
+  a.sgn = Sgn.positive
 
 func unsignedAddition(a: var BigInt, b, c: BigInt) =
   let
@@ -215,7 +206,7 @@ func unsignedAddition(a: var BigInt, b, c: BigInt) =
   a.isNegative = false
 
 func negate(a: var BigInt) =
-  a.isNegative = not a.isNegative
+  a.sgn = Sgn(-a.sgn)
 
 func `-`*(a: BigInt): BigInt =
   ## Unary minus for `BigInt`.
@@ -571,9 +562,8 @@ func `xor`*(a, b: BigInt): BigInt =
 
 func reset(a: var BigInt) =
   ## Resets a `BigInt` back to the zero value.
-  a.limbs.setLen(1)
-  a.limbs[0] = 0
-  a.isNegative = false
+  a.limbs.setLen(0)
+  a.sgn = Sgn.zero
 
 func unsignedDivRem(q: var BigInt, r: var uint32, n: BigInt, d: uint32) =
   q.limbs.setLen(n.limbs.len)
@@ -927,8 +917,8 @@ func toString*(a: BigInt, base: range[2..36] = 10): string =
       base = uint32(base)
       d = base ^ size
     var tmp = a
-
-    tmp.isNegative = false
+    
+    tmp.sgn = abs(tmp.sgn)
     result = newStringOfCap(size * a.limbs.len + 1) # estimate the length of the result
 
     while tmp > 0:
@@ -946,7 +936,7 @@ func toString*(a: BigInt, base: range[2..36] = 10): string =
     dec i
   result.setLen(i+1)
 
-  if a.isNegative:
+  if a.sgn == Sgn.negative:
     result.add('-')
 
   result.reverse()
@@ -1050,7 +1040,7 @@ func initBigInt*(str: string, base: range[2..36] = 10): BigInt =
             mul *= base
         unsignedAdditionInt(result, result * initBigInt(mul), num)
 
-  result.isNegative = neg
+  result.sgn = result.sgn * (if neg: Sgn.negative else: Sgn.positive)
 
 when (NimMajor, NimMinor) >= (1, 5):
   include bigints/private/literals
